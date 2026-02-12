@@ -1,0 +1,1830 @@
+# MCServerHub - AI Coding Assistant Rules
+
+## Project Overview
+
+MCServerHub is a full-stack Minecraft server management platform providing hybrid access through both a web dashboard and CLI.
+
+### Tech Stack
+- **Backend**: Java 17, Spring Boot 3.2.0, PostgreSQL, Docker API
+- **Frontend**: React 18, Vite, Tailwind CSS
+- **CLI**: Java with Picocli
+- **Core**: Shared module between backend and CLI
+- **Authentication**: JWT-based
+- **Real-time**: WebSocket for monitoring
+- **Containerization**: Docker-based server deployment
+
+---
+
+## Project Structure
+
+```
+mcserverhub/
+├── mcserverhub-core/          # Shared DTOs, enums, utilities
+├── mcserverhub-backend/       # Spring Boot REST API
+├── mcserverhub-frontend/      # React SPA
+├── mcserverhub-cli/           # Command-line interface
+└── docker/                    # Docker configurations
+```
+
+---
+
+## 1. Spring Boot Best Practices
+
+### Layered Architecture (MANDATORY)
+
+Always follow: **Controller → Service → Repository**
+
+```java
+// ✅ CORRECT: Controller delegates to Service
+@RestController
+@RequestMapping("/api/v1/servers")
+@RequiredArgsConstructor
+public class ServerController {
+    private final ServerService serverService;
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ServerResponse> getServer(@PathVariable UUID id) {
+        return ResponseEntity.ok(serverService.getServer(id));
+    }
+
+    @PostMapping
+    public ResponseEntity<ServerResponse> createServer(
+            @Valid @RequestBody CreateServerRequest request,
+            @AuthenticationPrincipal UserPrincipal principal) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(serverService.createServer(request, principal.getUserId()));
+    }
+}
+
+// ✅ CORRECT: Service contains business logic
+@Service
+@RequiredArgsConstructor
+@Transactional(readOnly = true)
+public class ServerService {
+    private final ServerRepository serverRepository;
+    private final DockerService dockerService;
+    private final ServerMapper serverMapper;
+
+    public ServerResponse getServer(UUID id) {
+        Server server = serverRepository.findById(id)
+                .orElseThrow(() -> new ServerNotFoundException(id));
+        return serverMapper.toResponse(server);
+    }
+
+    @Transactional
+    public ServerResponse createServer(CreateServerRequest request, UUID ownerId) {
+        validateServerName(request.getName());
+        Server server = serverMapper.toEntity(request, ownerId);
+        server = serverRepository.save(server);
+        dockerService.createContainer(server);
+        return serverMapper.toResponse(server);
+    }
+}
+
+// ✅ CORRECT: Repository for data access only
+@Repository
+public interface ServerRepository extends JpaRepository<Server, UUID> {
+    List<Server> findByOwnerId(UUID ownerId);
+    Optional<Server> findByNameAndOwnerId(String name, UUID ownerId);
+    
+    @Query("SELECT s FROM Server s WHERE s.status = :status AND s.lastHeartbeat < :threshold")
+    List<Server> findStaleServers(@Param("status") ServerStatus status, 
+                                   @Param("threshold") Instant threshold);
+}
+```
+
+### ❌ NEVER DO THIS:
+```java
+// ❌ WRONG: Business logic in controller
+@PostMapping
+public ResponseEntity<Server> createServer(@RequestBody CreateServerRequest request) {
+    // Business logic should NOT be in controller
+    if (serverRepository.existsByName(request.getName())) {
+        throw new RuntimeException("Server exists");
+    }
+    Server server = new Server();
+    server.setName(request.getName());
+    serverRepository.save(server);
+    dockerClient.createContainer(...); // Direct Docker calls in controller!
+    return ResponseEntity.ok(server); // Exposing entity directly!
+}
+```
+
+### Use Lombok Properly
+
+```java
+// ✅ CORRECT: Entity with Lombok
+@Entity
+@Table(name = "servers")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class Server {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private ServerStatus status;
+
+    @Column(name = "owner_id", nullable = false)
+    private UUID ownerId;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at")
+    private Instant updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = Instant.now();
+        updatedAt = Instant.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = Instant.now();
+    }
+}
+
+// ✅ CORRECT: Service with constructor injection via Lombok
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BackupService {
+    private final BackupRepository backupRepository;
+    private final StorageService storageService;
+    private final ServerService serverService;
+    // Constructor is auto-generated by @RequiredArgsConstructor
+}
+```
+
+---
+
+## 2. Security Rules (CRITICAL)
+
+### JWT Authentication
+
+```java
+// ✅ CORRECT: JWT Token Provider
+@Component
+@RequiredArgsConstructor
+public class JwtTokenProvider {
+    private final JwtProperties jwtProperties;
+
+    public String generateAccessToken(UserPrincipal principal) {
+        Instant now = Instant.now();
+        Instant expiry = now.plus(jwtProperties.getAccessTokenExpiration());
+
+        return Jwts.builder()
+                .setSubject(principal.getUserId().toString())
+                .claim("email", principal.getEmail())
+                .claim("roles", principal.getRoles())
+                .setIssuedAt(Date.from(now))
+                .setExpiration(Date.from(expiry))
+                .signWith(getSigningKey(), SignatureAlgorithm.HS512)
+                .compact();
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder()
+                    .setSigningKey(getSigningKey())
+                    .build()
+                    .parseClaimsJws(token);
+            return true;
+        } catch (JwtException | IllegalArgumentException e) {
+            log.warn("Invalid JWT token: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private Key getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(jwtProperties.getSecret());
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+```
+
+### Input Validation (MANDATORY)
+
+```java
+// ✅ CORRECT: DTO with validation
+public record CreateServerRequest(
+    @NotBlank(message = "Server name is required")
+    @Size(min = 3, max = 50, message = "Server name must be 3-50 characters")
+    @Pattern(regexp = "^[a-zA-Z0-9_-]+$", message = "Server name can only contain alphanumeric characters, underscores, and hyphens")
+    String name,
+
+    @NotNull(message = "Server type is required")
+    ServerType serverType,
+
+    @NotBlank(message = "Minecraft version is required")
+    @Pattern(regexp = "^\\d+\\.\\d+(\\.\\d+)?$", message = "Invalid Minecraft version format")
+    String minecraftVersion,
+
+    @Min(value = 512, message = "Minimum memory is 512MB")
+    @Max(value = 16384, message = "Maximum memory is 16GB")
+    Integer memoryMb,
+
+    @Min(value = 1024, message = "Minimum port is 1024")
+    @Max(value = 65535, message = "Maximum port is 65535")
+    Integer port
+) {}
+```
+
+### Path Traversal Prevention (CRITICAL)
+
+```java
+// ✅ CORRECT: Safe path handling for backups
+@Service
+@RequiredArgsConstructor
+public class BackupStorageService {
+    private final BackupProperties backupProperties;
+
+    public Path resolveBackupPath(UUID serverId, String backupName) {
+        // Validate backup name - NEVER trust user input
+        if (!isValidBackupName(backupName)) {
+            throw new InvalidBackupNameException(backupName);
+        }
+
+        Path basePath = Paths.get(backupProperties.getStoragePath()).toAbsolutePath().normalize();
+        Path serverPath = basePath.resolve(serverId.toString()).normalize();
+        Path backupPath = serverPath.resolve(backupName + ".zip").normalize();
+
+        // CRITICAL: Verify the resolved path is still within the base directory
+        if (!backupPath.startsWith(basePath)) {
+            log.error("Path traversal attempt detected: {} -> {}", backupName, backupPath);
+            throw new SecurityException("Invalid backup path");
+        }
+
+        return backupPath;
+    }
+
+    private boolean isValidBackupName(String name) {
+        // Only allow alphanumeric, underscores, hyphens, and timestamps
+        return name != null && 
+               name.matches("^[a-zA-Z0-9_-]{1,100}$") &&
+               !name.contains("..") &&
+               !name.contains("/") &&
+               !name.contains("\\");
+    }
+}
+
+// ❌ NEVER DO THIS:
+public Path getBackupPath(String userProvidedPath) {
+    return Paths.get("/backups/" + userProvidedPath); // VULNERABLE!
+}
+```
+
+### SQL Injection Prevention
+
+```java
+// ✅ CORRECT: Use parameterized queries
+@Repository
+public interface ServerRepository extends JpaRepository<Server, UUID> {
+    // Spring Data JPA handles parameterization
+    List<Server> findByNameContainingIgnoreCase(String name);
+
+    // Native query with parameters
+    @Query(value = "SELECT * FROM servers WHERE name ILIKE :pattern", nativeQuery = true)
+    List<Server> searchByName(@Param("pattern") String pattern);
+}
+
+// ✅ CORRECT: Dynamic queries with Criteria API
+@Repository
+@RequiredArgsConstructor
+public class ServerSearchRepository {
+    private final EntityManager entityManager;
+
+    public List<Server> search(ServerSearchCriteria criteria) {
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Server> query = cb.createQuery(Server.class);
+        Root<Server> root = query.from(Server.class);
+
+        List<Predicate> predicates = new ArrayList<>();
+
+        if (criteria.getName() != null) {
+            predicates.add(cb.like(cb.lower(root.get("name")), 
+                    "%" + criteria.getName().toLowerCase() + "%"));
+        }
+
+        if (criteria.getStatus() != null) {
+            predicates.add(cb.equal(root.get("status"), criteria.getStatus()));
+        }
+
+        query.where(predicates.toArray(new Predicate[0]));
+        return entityManager.createQuery(query).getResultList();
+    }
+}
+
+// ❌ NEVER DO THIS:
+@Query("SELECT s FROM Server s WHERE s.name = '" + name + "'") // SQL INJECTION!
+List<Server> findByName(String name);
+```
+
+### Authorization Checks
+
+```java
+// ✅ CORRECT: Service-level authorization
+@Service
+@RequiredArgsConstructor
+public class ServerService {
+    private final ServerRepository serverRepository;
+
+    public ServerResponse getServer(UUID serverId, UUID requestingUserId) {
+        Server server = serverRepository.findById(serverId)
+                .orElseThrow(() -> new ServerNotFoundException(serverId));
+
+        // Always verify ownership/access
+        if (!server.getOwnerId().equals(requestingUserId) && 
+            !hasSharedAccess(serverId, requestingUserId)) {
+            throw new AccessDeniedException("You don't have access to this server");
+        }
+
+        return serverMapper.toResponse(server);
+    }
+
+    @Transactional
+    public void deleteServer(UUID serverId, UUID requestingUserId) {
+        Server server = serverRepository.findById(serverId)
+                .orElseThrow(() -> new ServerNotFoundException(serverId));
+
+        // Only owner can delete
+        if (!server.getOwnerId().equals(requestingUserId)) {
+            throw new AccessDeniedException("Only the owner can delete this server");
+        }
+
+        // Perform deletion...
+    }
+}
+
+// ✅ CORRECT: Method-level security
+@PreAuthorize("hasRole('ADMIN') or @serverSecurityService.isOwner(#serverId, authentication.principal.userId)")
+public void performAdminAction(UUID serverId) {
+    // ...
+}
+```
+
+---
+
+## 3. DTOs - Never Expose Entities
+
+### DTO Pattern
+
+```java
+// ✅ CORRECT: Request/Response DTOs
+// Request DTO (immutable record)
+public record CreateBackupRequest(
+    @NotNull UUID serverId,
+    @Size(max = 200) String description,
+    BackupType type
+) {}
+
+// Response DTO (immutable record)
+public record BackupResponse(
+    UUID id,
+    UUID serverId,
+    String serverName,
+    String description,
+    BackupType type,
+    BackupStatus status,
+    Long sizeBytes,
+    String checksum,
+    Instant createdAt,
+    Instant completedAt
+) {}
+
+// ✅ CORRECT: Mapper using MapStruct
+@Mapper(componentModel = "spring")
+public interface BackupMapper {
+    @Mapping(target = "serverName", source = "server.name")
+    BackupResponse toResponse(Backup backup);
+
+    List<BackupResponse> toResponseList(List<Backup> backups);
+
+    @Mapping(target = "id", ignore = true)
+    @Mapping(target = "status", constant = "PENDING")
+    @Mapping(target = "createdAt", ignore = true)
+    Backup toEntity(CreateBackupRequest request, Server server);
+}
+```
+
+### Pagination Response
+
+```java
+// ✅ CORRECT: Paginated response wrapper
+public record PagedResponse<T>(
+    List<T> content,
+    int page,
+    int size,
+    long totalElements,
+    int totalPages,
+    boolean first,
+    boolean last
+) {
+    public static <T> PagedResponse<T> from(Page<T> page) {
+        return new PagedResponse<>(
+            page.getContent(),
+            page.getNumber(),
+            page.getSize(),
+            page.getTotalElements(),
+            page.getTotalPages(),
+            page.isFirst(),
+            page.isLast()
+        );
+    }
+}
+```
+
+---
+
+## 4. Error Handling
+
+### Custom Exceptions
+
+```java
+// ✅ CORRECT: Custom exception hierarchy
+public abstract class McServerHubException extends RuntimeException {
+    private final String errorCode;
+    private final HttpStatus httpStatus;
+
+    protected McServerHubException(String message, String errorCode, HttpStatus httpStatus) {
+        super(message);
+        this.errorCode = errorCode;
+        this.httpStatus = httpStatus;
+    }
+
+    public String getErrorCode() { return errorCode; }
+    public HttpStatus getHttpStatus() { return httpStatus; }
+}
+
+public class ServerNotFoundException extends McServerHubException {
+    public ServerNotFoundException(UUID serverId) {
+        super(
+            "Server not found: " + serverId,
+            "SERVER_NOT_FOUND",
+            HttpStatus.NOT_FOUND
+        );
+    }
+}
+
+public class BackupInProgressException extends McServerHubException {
+    public BackupInProgressException(UUID serverId) {
+        super(
+            "A backup is already in progress for server: " + serverId,
+            "BACKUP_IN_PROGRESS",
+            HttpStatus.CONFLICT
+        );
+    }
+}
+
+public class ServerOperationException extends McServerHubException {
+    public ServerOperationException(String operation, String reason) {
+        super(
+            "Failed to " + operation + ": " + reason,
+            "SERVER_OPERATION_FAILED",
+            HttpStatus.INTERNAL_SERVER_ERROR
+        );
+    }
+}
+```
+
+### Global Exception Handler
+
+```java
+// ✅ CORRECT: Centralized error handling
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(McServerHubException.class)
+    public ResponseEntity<ErrorResponse> handleMcServerHubException(McServerHubException ex) {
+        log.warn("Application error: {} - {}", ex.getErrorCode(), ex.getMessage());
+        return ResponseEntity
+                .status(ex.getHttpStatus())
+                .body(new ErrorResponse(ex.getErrorCode(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ValidationErrorResponse> handleValidationException(
+            MethodArgumentNotValidException ex) {
+        Map<String, String> errors = ex.getBindingResult()
+                .getFieldErrors()
+                .stream()
+                .collect(Collectors.toMap(
+                        FieldError::getField,
+                        error -> error.getDefaultMessage() != null ? error.getDefaultMessage() : "Invalid value",
+                        (existing, replacement) -> existing
+                ));
+
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(new ValidationErrorResponse("VALIDATION_ERROR", "Validation failed", errors));
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex) {
+        log.warn("Access denied: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.FORBIDDEN)
+                .body(new ErrorResponse("ACCESS_DENIED", "You don't have permission to perform this action"));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleUnexpectedException(Exception ex) {
+        log.error("Unexpected error", ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ErrorResponse("INTERNAL_ERROR", "An unexpected error occurred"));
+    }
+}
+
+public record ErrorResponse(String code, String message) {}
+
+public record ValidationErrorResponse(
+    String code,
+    String message,
+    Map<String, String> fieldErrors
+) {}
+```
+
+---
+
+## 5. Backup/Restore System
+
+### Backup Service with Integrity Checks
+
+```java
+// ✅ CORRECT: Safe backup implementation
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BackupService {
+    private final BackupRepository backupRepository;
+    private final ServerRepository serverRepository;
+    private final BackupStorageService storageService;
+    private final BackupMapper backupMapper;
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    public BackupResponse createBackup(CreateBackupRequest request, UUID userId) {
+        Server server = serverRepository.findById(request.serverId())
+                .orElseThrow(() -> new ServerNotFoundException(request.serverId()));
+
+        // Authorization check
+        if (!server.getOwnerId().equals(userId)) {
+            throw new AccessDeniedException("You don't have access to this server");
+        }
+
+        // Check for existing backup in progress
+        if (backupRepository.existsByServerIdAndStatus(server.getId(), BackupStatus.IN_PROGRESS)) {
+            throw new BackupInProgressException(server.getId());
+        }
+
+        // Create backup record
+        Backup backup = Backup.builder()
+                .server(server)
+                .description(request.description())
+                .type(request.type() != null ? request.type() : BackupType.MANUAL)
+                .status(BackupStatus.PENDING)
+                .build();
+
+        backup = backupRepository.save(backup);
+
+        // Trigger async backup process
+        eventPublisher.publishEvent(new BackupStartedEvent(backup.getId()));
+
+        return backupMapper.toResponse(backup);
+    }
+
+    @Async
+    @TransactionalEventListener
+    public void processBackup(BackupStartedEvent event) {
+        Backup backup = backupRepository.findById(event.backupId())
+                .orElseThrow(() -> new BackupNotFoundException(event.backupId()));
+
+        try {
+            backup.setStatus(BackupStatus.IN_PROGRESS);
+            backupRepository.save(backup);
+
+            // Perform backup
+            BackupResult result = storageService.createBackup(backup.getServer());
+
+            // Update with results
+            backup.setStatus(BackupStatus.COMPLETED);
+            backup.setSizeBytes(result.sizeBytes());
+            backup.setChecksum(result.sha256Checksum());
+            backup.setFilePath(result.filePath());
+            backup.setCompletedAt(Instant.now());
+            backupRepository.save(backup);
+
+            log.info("Backup completed: {} ({})", backup.getId(), formatSize(result.sizeBytes()));
+
+        } catch (Exception e) {
+            log.error("Backup failed: {}", backup.getId(), e);
+            backup.setStatus(BackupStatus.FAILED);
+            backup.setErrorMessage(e.getMessage());
+            backupRepository.save(backup);
+        }
+    }
+}
+```
+
+### Restore with Rollback Capability
+
+```java
+// ✅ CORRECT: Safe restore with rollback
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RestoreService {
+    private final BackupRepository backupRepository;
+    private final ServerService serverService;
+    private final BackupStorageService storageService;
+    private final RestoreRepository restoreRepository;
+
+    @Transactional
+    public RestoreResponse restoreBackup(UUID backupId, UUID userId) {
+        Backup backup = backupRepository.findById(backupId)
+                .orElseThrow(() -> new BackupNotFoundException(backupId));
+
+        Server server = backup.getServer();
+
+        // Authorization
+        if (!server.getOwnerId().equals(userId)) {
+            throw new AccessDeniedException("You don't have access to this server");
+        }
+
+        // Validate backup integrity before restore
+        validateBackupIntegrity(backup);
+
+        // Stop server if running
+        ServerStatus previousStatus = server.getStatus();
+        if (previousStatus == ServerStatus.RUNNING) {
+            serverService.stopServer(server.getId(), userId);
+        }
+
+        // Create pre-restore backup for rollback
+        Backup rollbackBackup = createRollbackBackup(server);
+
+        // Create restore record
+        Restore restore = Restore.builder()
+                .backup(backup)
+                .server(server)
+                .rollbackBackupId(rollbackBackup.getId())
+                .status(RestoreStatus.IN_PROGRESS)
+                .build();
+
+        restore = restoreRepository.save(restore);
+
+        try {
+            // Perform restore
+            storageService.restoreBackup(backup, server);
+
+            restore.setStatus(RestoreStatus.COMPLETED);
+            restore.setCompletedAt(Instant.now());
+            restoreRepository.save(restore);
+
+            // Restart server if it was running
+            if (previousStatus == ServerStatus.RUNNING) {
+                serverService.startServer(server.getId(), userId);
+            }
+
+            log.info("Restore completed: backup {} to server {}", backupId, server.getId());
+            return restoreMapper.toResponse(restore);
+
+        } catch (Exception e) {
+            log.error("Restore failed, initiating rollback: {}", restore.getId(), e);
+
+            // Rollback to previous state
+            try {
+                storageService.restoreBackup(rollbackBackup, server);
+                restore.setStatus(RestoreStatus.ROLLED_BACK);
+                restore.setErrorMessage("Restore failed, rolled back: " + e.getMessage());
+            } catch (Exception rollbackEx) {
+                log.error("Rollback also failed!", rollbackEx);
+                restore.setStatus(RestoreStatus.FAILED);
+                restore.setErrorMessage("Restore and rollback both failed: " + e.getMessage());
+            }
+
+            restoreRepository.save(restore);
+            throw new RestoreFailedException(backupId, e);
+        }
+    }
+
+    private void validateBackupIntegrity(Backup backup) {
+        if (backup.getStatus() != BackupStatus.COMPLETED) {
+            throw new InvalidBackupStateException("Backup is not in completed state");
+        }
+
+        String storedChecksum = backup.getChecksum();
+        String actualChecksum = storageService.calculateChecksum(backup.getFilePath());
+
+        if (!storedChecksum.equals(actualChecksum)) {
+            log.error("Backup integrity check failed: {} (expected: {}, actual: {})",
+                    backup.getId(), storedChecksum, actualChecksum);
+            throw new BackupCorruptedException(backup.getId());
+        }
+    }
+}
+```
+
+### Automated Backup Scheduling
+
+```java
+// ✅ CORRECT: Scheduled backup with proper error handling
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ScheduledBackupService {
+    private final BackupScheduleRepository scheduleRepository;
+    private final BackupService backupService;
+    private final ServerRepository serverRepository;
+
+    @Scheduled(cron = "0 */15 * * * *") // Every 15 minutes
+    @SchedulerLock(name = "scheduledBackup", lockAtMostFor = "14m")
+    public void processScheduledBackups() {
+        Instant now = Instant.now();
+        List<BackupSchedule> dueSchedules = scheduleRepository.findDueSchedules(now);
+
+        for (BackupSchedule schedule : dueSchedules) {
+            try {
+                processSchedule(schedule);
+            } catch (Exception e) {
+                log.error("Failed to process scheduled backup: {}", schedule.getId(), e);
+                incrementFailureCount(schedule);
+            }
+        }
+    }
+
+    private void processSchedule(BackupSchedule schedule) {
+        Server server = schedule.getServer();
+
+        // Skip if server is not running
+        if (server.getStatus() != ServerStatus.RUNNING) {
+            log.debug("Skipping scheduled backup for non-running server: {}", server.getId());
+            return;
+        }
+
+        CreateBackupRequest request = new CreateBackupRequest(
+                server.getId(),
+                "Scheduled backup - " + schedule.getName(),
+                BackupType.SCHEDULED
+        );
+
+        backupService.createBackup(request, server.getOwnerId());
+
+        // Update next run time
+        schedule.setLastRunAt(Instant.now());
+        schedule.setNextRunAt(calculateNextRun(schedule));
+        schedule.setConsecutiveFailures(0);
+        scheduleRepository.save(schedule);
+
+        // Clean up old backups based on retention policy
+        cleanupOldBackups(schedule);
+    }
+
+    private void cleanupOldBackups(BackupSchedule schedule) {
+        List<Backup> oldBackups = backupRepository.findOldScheduledBackups(
+                schedule.getServer().getId(),
+                schedule.getRetentionCount()
+        );
+
+        for (Backup backup : oldBackups) {
+            try {
+                storageService.deleteBackup(backup);
+                backupRepository.delete(backup);
+                log.info("Deleted old backup: {}", backup.getId());
+            } catch (Exception e) {
+                log.error("Failed to delete old backup: {}", backup.getId(), e);
+            }
+        }
+    }
+}
+```
+
+---
+
+## 6. Core Module - Shared Code
+
+### Shared DTOs and Enums
+
+```java
+// mcserverhub-core/src/main/java/com/mcserverhub/core/model/
+
+// ✅ CORRECT: Shared enum
+public enum ServerStatus {
+    STOPPED("Stopped"),
+    STARTING("Starting"),
+    RUNNING("Running"),
+    STOPPING("Stopping"),
+    ERROR("Error"),
+    CRASHED("Crashed");
+
+    private final String displayName;
+
+    ServerStatus(String displayName) {
+        this.displayName = displayName;
+    }
+
+    public String getDisplayName() {
+        return displayName;
+    }
+
+    public boolean isTransitional() {
+        return this == STARTING || this == STOPPING;
+    }
+
+    public boolean canStart() {
+        return this == STOPPED || this == ERROR || this == CRASHED;
+    }
+
+    public boolean canStop() {
+        return this == RUNNING;
+    }
+}
+
+// ✅ CORRECT: Shared DTO for API responses (used by both backend and CLI)
+public record ServerInfo(
+    UUID id,
+    String name,
+    ServerStatus status,
+    ServerType type,
+    String minecraftVersion,
+    Integer port,
+    Integer memoryMb,
+    Integer playerCount,
+    Integer maxPlayers,
+    Instant startedAt,
+    Duration uptime
+) implements Serializable {
+    private static final long serialVersionUID = 1L;
+}
+```
+
+### Shared Utilities
+
+```java
+// ✅ CORRECT: Shared utility in core module
+public final class FileUtils {
+    private FileUtils() {} // Utility class
+
+    public static String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = "KMGTPE".charAt(exp - 1) + "B";
+        return String.format("%.1f %s", bytes / Math.pow(1024, exp), pre);
+    }
+
+    public static String calculateSHA256(Path file) throws IOException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream is = Files.newInputStream(file);
+             DigestInputStream dis = new DigestInputStream(is, digest)) {
+            byte[] buffer = new byte[8192];
+            while (dis.read(buffer) != -1) {
+                // Reading updates digest
+            }
+        }
+        return bytesToHex(digest.digest());
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+}
+```
+
+### API Client for CLI
+
+```java
+// ✅ CORRECT: Shared API client configuration
+public interface McServerHubApiClient {
+    // Server operations
+    ServerInfo getServer(UUID serverId);
+    List<ServerInfo> listServers();
+    ServerInfo createServer(CreateServerRequest request);
+    void deleteServer(UUID serverId);
+    void startServer(UUID serverId);
+    void stopServer(UUID serverId);
+    void restartServer(UUID serverId);
+
+    // Backup operations
+    BackupInfo createBackup(UUID serverId, String description);
+    List<BackupInfo> listBackups(UUID serverId);
+    void restoreBackup(UUID backupId);
+    void deleteBackup(UUID backupId);
+
+    // Authentication
+    AuthResponse login(String email, String password);
+    void logout();
+}
+```
+
+---
+
+## 7. React Frontend Best Practices
+
+### Custom Hooks
+
+```typescript
+// ✅ CORRECT: Custom hook for server management
+import { useState, useCallback } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { serverApi } from '@/api/serverApi';
+import { Server, ServerStatus } from '@/types';
+import { toast } from '@/components/ui/toast';
+
+export function useServer(serverId: string) {
+  const queryClient = useQueryClient();
+
+  const {
+    data: server,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ['server', serverId],
+    queryFn: () => serverApi.getServer(serverId),
+    refetchInterval: (data) => 
+      data?.status === ServerStatus.STARTING || data?.status === ServerStatus.STOPPING
+        ? 2000 
+        : false,
+  });
+
+  const startMutation = useMutation({
+    mutationFn: () => serverApi.startServer(serverId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['server', serverId] });
+      toast.success('Server starting...');
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to start server: ${error.message}`);
+    },
+  });
+
+  const stopMutation = useMutation({
+    mutationFn: () => serverApi.stopServer(serverId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['server', serverId] });
+      toast.success('Server stopping...');
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to stop server: ${error.message}`);
+    },
+  });
+
+  return {
+    server,
+    isLoading,
+    error,
+    refetch,
+    startServer: startMutation.mutate,
+    stopServer: stopMutation.mutate,
+    isStarting: startMutation.isPending,
+    isStopping: stopMutation.isPending,
+  };
+}
+```
+
+### WebSocket Hook for Real-time Monitoring
+
+```typescript
+// ✅ CORRECT: WebSocket hook for server console
+import { useEffect, useRef, useCallback, useState } from 'react';
+import { useAuth } from '@/hooks/useAuth';
+
+interface ConsoleMessage {
+  timestamp: string;
+  level: 'INFO' | 'WARN' | 'ERROR';
+  message: string;
+}
+
+export function useServerConsole(serverId: string) {
+  const [messages, setMessages] = useState<ConsoleMessage[]>([]);
+  const [isConnected, setIsConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const { accessToken } = useAuth();
+
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
+    const ws = new WebSocket(
+      `${import.meta.env.VITE_WS_URL}/servers/${serverId}/console?token=${accessToken}`
+    );
+
+    ws.onopen = () => {
+      setIsConnected(true);
+      console.log('Console WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+      const message: ConsoleMessage = JSON.parse(event.data);
+      setMessages((prev) => [...prev.slice(-500), message]); // Keep last 500 messages
+    };
+
+    ws.onclose = () => {
+      setIsConnected(false);
+      // Reconnect after delay
+      setTimeout(() => connect(), 3000);
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+
+    wsRef.current = ws;
+  }, [serverId, accessToken]);
+
+  const sendCommand = useCallback((command: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'command', payload: command }));
+    }
+  }, []);
+
+  const disconnect = useCallback(() => {
+    wsRef.current?.close();
+    wsRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    connect();
+    return () => disconnect();
+  }, [connect, disconnect]);
+
+  return {
+    messages,
+    isConnected,
+    sendCommand,
+    clearMessages: () => setMessages([]),
+  };
+}
+```
+
+### Component Pattern
+
+```tsx
+// ✅ CORRECT: Clean component with proper types
+import { FC, useState } from 'react';
+import { Server, ServerStatus } from '@/types';
+import { useServer } from '@/hooks/useServer';
+import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
+import { Card } from '@/components/ui/Card';
+import { PlayIcon, StopIcon, RefreshIcon } from '@/components/icons';
+
+interface ServerCardProps {
+  serverId: string;
+  onSelect?: (server: Server) => void;
+}
+
+export const ServerCard: FC<ServerCardProps> = ({ serverId, onSelect }) => {
+  const { server, isLoading, startServer, stopServer, isStarting, isStopping } = useServer(serverId);
+
+  if (isLoading) {
+    return <ServerCardSkeleton />;
+  }
+
+  if (!server) {
+    return null;
+  }
+
+  const canStart = server.status === ServerStatus.STOPPED || server.status === ServerStatus.CRASHED;
+  const canStop = server.status === ServerStatus.RUNNING;
+  const isTransitional = server.status === ServerStatus.STARTING || server.status === ServerStatus.STOPPING;
+
+  return (
+    <Card 
+      className="p-4 hover:shadow-lg transition-shadow cursor-pointer"
+      onClick={() => onSelect?.(server)}
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-semibold">{server.name}</h3>
+          <p className="text-sm text-gray-500">
+            {server.type} • {server.minecraftVersion}
+          </p>
+        </div>
+        <StatusBadge status={server.status} />
+      </div>
+
+      <div className="mt-4 flex items-center gap-2">
+        {canStart && (
+          <Button
+            size="sm"
+            onClick={(e) => {
+              e.stopPropagation();
+              startServer();
+            }}
+            disabled={isStarting}
+          >
+            <PlayIcon className="w-4 h-4 mr-1" />
+            {isStarting ? 'Starting...' : 'Start'}
+          </Button>
+        )}
+
+        {canStop && (
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={(e) => {
+              e.stopPropagation();
+              stopServer();
+            }}
+            disabled={isStopping}
+          >
+            <StopIcon className="w-4 h-4 mr-1" />
+            {isStopping ? 'Stopping...' : 'Stop'}
+          </Button>
+        )}
+
+        {isTransitional && (
+          <div className="flex items-center text-sm text-gray-500">
+            <RefreshIcon className="w-4 h-4 mr-1 animate-spin" />
+            {server.status === ServerStatus.STARTING ? 'Starting...' : 'Stopping...'}
+          </div>
+        )}
+      </div>
+
+      {server.status === ServerStatus.RUNNING && (
+        <div className="mt-3 text-sm text-gray-600">
+          <span>{server.playerCount}/{server.maxPlayers} players</span>
+          <span className="mx-2">•</span>
+          <span>Port: {server.port}</span>
+        </div>
+      )}
+    </Card>
+  );
+};
+
+const StatusBadge: FC<{ status: ServerStatus }> = ({ status }) => {
+  const variants: Record<ServerStatus, 'success' | 'warning' | 'error' | 'secondary'> = {
+    [ServerStatus.RUNNING]: 'success',
+    [ServerStatus.STARTING]: 'warning',
+    [ServerStatus.STOPPING]: 'warning',
+    [ServerStatus.STOPPED]: 'secondary',
+    [ServerStatus.ERROR]: 'error',
+    [ServerStatus.CRASHED]: 'error',
+  };
+
+  return <Badge variant={variants[status]}>{status}</Badge>;
+};
+```
+
+### API Layer
+
+```typescript
+// ✅ CORRECT: Type-safe API client
+import axios, { AxiosInstance, AxiosError } from 'axios';
+import { getAccessToken, refreshAccessToken } from '@/auth';
+
+const api: AxiosInstance = axios.create({
+  baseURL: import.meta.env.VITE_API_URL,
+  timeout: 30000,
+});
+
+// Request interceptor for auth
+api.interceptors.request.use((config) => {
+  const token = getAccessToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Response interceptor for token refresh
+api.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config;
+    
+    if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+      originalRequest._retry = true;
+      
+      try {
+        await refreshAccessToken();
+        return api(originalRequest);
+      } catch (refreshError) {
+        // Redirect to login
+        window.location.href = '/login';
+        return Promise.reject(refreshError);
+      }
+    }
+    
+    return Promise.reject(error);
+  }
+);
+
+// Type-safe API functions
+export const serverApi = {
+  getServer: async (id: string): Promise<Server> => {
+    const { data } = await api.get(`/api/v1/servers/${id}`);
+    return data;
+  },
+
+  listServers: async (): Promise<Server[]> => {
+    const { data } = await api.get('/api/v1/servers');
+    return data;
+  },
+
+  createServer: async (request: CreateServerRequest): Promise<Server> => {
+    const { data } = await api.post('/api/v1/servers', request);
+    return data;
+  },
+
+  startServer: async (id: string): Promise<void> => {
+    await api.post(`/api/v1/servers/${id}/start`);
+  },
+
+  stopServer: async (id: string): Promise<void> => {
+    await api.post(`/api/v1/servers/${id}/stop`);
+  },
+};
+```
+
+---
+
+## 8. CLI with Picocli
+
+### Command Structure
+
+```java
+// ✅ CORRECT: CLI main command
+@Command(
+    name = "mcshub",
+    description = "MCServerHub CLI - Manage Minecraft servers",
+    mixinStandardHelpOptions = true,
+    version = "1.0.0",
+    subcommands = {
+        ServerCommand.class,
+        BackupCommand.class,
+        LoginCommand.class,
+        ConfigCommand.class
+    }
+)
+public class McServerHubCli implements Runnable {
+    @Spec
+    CommandSpec spec;
+
+    @Override
+    public void run() {
+        spec.commandLine().usage(System.out);
+    }
+
+    public static void main(String[] args) {
+        int exitCode = new CommandLine(new McServerHubCli())
+                .setExecutionStrategy(new RunLast())
+                .execute(args);
+        System.exit(exitCode);
+    }
+}
+
+// ✅ CORRECT: Server subcommand
+@Command(
+    name = "server",
+    description = "Manage servers",
+    subcommands = {
+        ServerListCommand.class,
+        ServerStartCommand.class,
+        ServerStopCommand.class,
+        ServerCreateCommand.class
+    }
+)
+public class ServerCommand implements Runnable {
+    @Override
+    public void run() {
+        CommandLine.usage(this, System.out);
+    }
+}
+
+// ✅ CORRECT: Server list command
+@Command(name = "list", description = "List all servers")
+public class ServerListCommand implements Callable<Integer> {
+    @Inject
+    private McServerHubApiClient apiClient;
+
+    @Option(names = {"-f", "--format"}, description = "Output format: table, json, yaml")
+    private OutputFormat format = OutputFormat.TABLE;
+
+    @Option(names = {"-s", "--status"}, description = "Filter by status")
+    private ServerStatus status;
+
+    @Override
+    public Integer call() {
+        try {
+            List<ServerInfo> servers = apiClient.listServers();
+
+            if (status != null) {
+                servers = servers.stream()
+                        .filter(s -> s.status() == status)
+                        .toList();
+            }
+
+            OutputFormatter.format(servers, format);
+            return 0;
+
+        } catch (ApiException e) {
+            System.err.println("Error: " + e.getMessage());
+            return 1;
+        }
+    }
+}
+
+// ✅ CORRECT: Server start command with confirmation
+@Command(name = "start", description = "Start a server")
+public class ServerStartCommand implements Callable<Integer> {
+    @Inject
+    private McServerHubApiClient apiClient;
+
+    @Parameters(index = "0", description = "Server ID or name")
+    private String serverIdOrName;
+
+    @Option(names = {"-w", "--wait"}, description = "Wait for server to be fully started")
+    private boolean wait;
+
+    @Override
+    public Integer call() {
+        try {
+            UUID serverId = resolveServerId(serverIdOrName);
+            ServerInfo server = apiClient.getServer(serverId);
+
+            if (!server.status().canStart()) {
+                System.err.println("Server cannot be started in current state: " + server.status());
+                return 1;
+            }
+
+            System.out.println("Starting server: " + server.name());
+            apiClient.startServer(serverId);
+
+            if (wait) {
+                return waitForStatus(serverId, ServerStatus.RUNNING, Duration.ofMinutes(5));
+            }
+
+            System.out.println("Start command sent successfully");
+            return 0;
+
+        } catch (ApiException e) {
+            System.err.println("Error: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private int waitForStatus(UUID serverId, ServerStatus targetStatus, Duration timeout) throws InterruptedException {
+        Instant deadline = Instant.now().plus(timeout);
+        System.out.print("Waiting for server to be " + targetStatus.getDisplayName());
+
+        while (Instant.now().isBefore(deadline)) {
+            ServerInfo server = apiClient.getServer(serverId);
+
+            if (server.status() == targetStatus) {
+                System.out.println("\nServer is now " + targetStatus.getDisplayName());
+                return 0;
+            }
+
+            if (server.status() == ServerStatus.ERROR || server.status() == ServerStatus.CRASHED) {
+                System.out.println("\nServer failed to start: " + server.status());
+                return 1;
+            }
+
+            System.out.print(".");
+            Thread.sleep(2000);
+        }
+
+        System.out.println("\nTimeout waiting for server to reach " + targetStatus);
+        return 1;
+    }
+}
+```
+
+---
+
+## 9. Testing Standards
+
+### Unit Tests
+
+```java
+// ✅ CORRECT: Service unit test
+@ExtendWith(MockitoExtension.class)
+class ServerServiceTest {
+    @Mock
+    private ServerRepository serverRepository;
+    
+    @Mock
+    private DockerService dockerService;
+    
+    @Mock
+    private ServerMapper serverMapper;
+
+    @InjectMocks
+    private ServerService serverService;
+
+    @Test
+    void getServer_WhenServerExists_ReturnsServerResponse() {
+        // Arrange
+        UUID serverId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        Server server = createTestServer(serverId, ownerId);
+        ServerResponse expectedResponse = createTestServerResponse(serverId);
+
+        when(serverRepository.findById(serverId)).thenReturn(Optional.of(server));
+        when(serverMapper.toResponse(server)).thenReturn(expectedResponse);
+
+        // Act
+        ServerResponse result = serverService.getServer(serverId);
+
+        // Assert
+        assertThat(result).isEqualTo(expectedResponse);
+        verify(serverRepository).findById(serverId);
+    }
+
+    @Test
+    void getServer_WhenServerNotFound_ThrowsException() {
+        // Arrange
+        UUID serverId = UUID.randomUUID();
+        when(serverRepository.findById(serverId)).thenReturn(Optional.empty());
+
+        // Act & Assert
+        assertThrows(ServerNotFoundException.class, 
+                () -> serverService.getServer(serverId));
+    }
+
+    @Test
+    void createServer_WithValidRequest_CreatesAndReturnsServer() {
+        // Arrange
+        UUID ownerId = UUID.randomUUID();
+        CreateServerRequest request = new CreateServerRequest(
+                "test-server", ServerType.PAPER, "1.20.4", 2048, 25565);
+        Server server = createTestServer(UUID.randomUUID(), ownerId);
+        ServerResponse expectedResponse = createTestServerResponse(server.getId());
+
+        when(serverMapper.toEntity(request, ownerId)).thenReturn(server);
+        when(serverRepository.save(server)).thenReturn(server);
+        when(serverMapper.toResponse(server)).thenReturn(expectedResponse);
+
+        // Act
+        ServerResponse result = serverService.createServer(request, ownerId);
+
+        // Assert
+        assertThat(result).isEqualTo(expectedResponse);
+        verify(dockerService).createContainer(server);
+        verify(serverRepository).save(server);
+    }
+
+    private Server createTestServer(UUID id, UUID ownerId) {
+        return Server.builder()
+                .id(id)
+                .name("test-server")
+                .status(ServerStatus.STOPPED)
+                .ownerId(ownerId)
+                .build();
+    }
+}
+```
+
+### Integration Tests
+
+```java
+// ✅ CORRECT: Controller integration test
+@SpringBootTest
+@AutoConfigureMockMvc
+@Testcontainers
+class ServerControllerIntegrationTest {
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15");
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private ServerRepository serverRepository;
+
+    @Autowired
+    private JwtTokenProvider tokenProvider;
+
+    private String authToken;
+    private UUID userId;
+
+    @BeforeEach
+    void setUp() {
+        userId = UUID.randomUUID();
+        authToken = tokenProvider.generateAccessToken(
+                new UserPrincipal(userId, "test@example.com", Set.of("USER")));
+    }
+
+    @AfterEach
+    void tearDown() {
+        serverRepository.deleteAll();
+    }
+
+    @Test
+    void createServer_WithValidRequest_ReturnsCreated() throws Exception {
+        CreateServerRequest request = new CreateServerRequest(
+                "integration-test-server",
+                ServerType.PAPER,
+                "1.20.4",
+                2048,
+                25565
+        );
+
+        mockMvc.perform(post("/api/v1/servers")
+                        .header("Authorization", "Bearer " + authToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.name").value("integration-test-server"))
+                .andExpect(jsonPath("$.status").value("STOPPED"))
+                .andExpect(jsonPath("$.id").exists());
+    }
+
+    @Test
+    void createServer_WithInvalidName_ReturnsBadRequest() throws Exception {
+        CreateServerRequest request = new CreateServerRequest(
+                "invalid name with spaces!",
+                ServerType.PAPER,
+                "1.20.4",
+                2048,
+                25565
+        );
+
+        mockMvc.perform(post("/api/v1/servers")
+                        .header("Authorization", "Bearer " + authToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.fieldErrors.name").exists());
+    }
+
+    @Test
+    void getServer_WithoutAuth_ReturnsUnauthorized() throws Exception {
+        mockMvc.perform(get("/api/v1/servers/" + UUID.randomUUID()))
+                .andExpect(status().isUnauthorized());
+    }
+}
+```
+
+### React Component Tests
+
+```typescript
+// ✅ CORRECT: Component test
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ServerCard } from '@/components/ServerCard';
+import { serverApi } from '@/api/serverApi';
+import { ServerStatus } from '@/types';
+
+jest.mock('@/api/serverApi');
+
+const mockServer = {
+  id: 'test-server-id',
+  name: 'Test Server',
+  status: ServerStatus.STOPPED,
+  type: 'PAPER',
+  minecraftVersion: '1.20.4',
+  port: 25565,
+  playerCount: 0,
+  maxPlayers: 20,
+};
+
+const createWrapper = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+    },
+  });
+  return ({ children }: { children: React.ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+};
+
+describe('ServerCard', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (serverApi.getServer as jest.Mock).mockResolvedValue(mockServer);
+  });
+
+  it('renders server information', async () => {
+    render(<ServerCard serverId="test-server-id" />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Server')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/PAPER.*1.20.4/)).toBeInTheDocument();
+    expect(screen.getByText('STOPPED')).toBeInTheDocument();
+  });
+
+  it('shows start button when server is stopped', async () => {
+    render(<ServerCard serverId="test-server-id" />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /start/i })).toBeInTheDocument();
+    });
+  });
+
+  it('calls startServer when start button clicked', async () => {
+    (serverApi.startServer as jest.Mock).mockResolvedValue(undefined);
+
+    render(<ServerCard serverId="test-server-id" />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    });
+
+    expect(serverApi.startServer).toHaveBeenCalledWith('test-server-id');
+  });
+});
+```
+
+---
+
+## 10. Things to AVOID
+
+### Security Anti-patterns
+
+```java
+// ❌ NEVER: Log sensitive information
+log.info("User {} logged in with password {}", username, password);
+log.debug("JWT token: {}", token);
+
+// ❌ NEVER: Expose internal errors to users
+@ExceptionHandler(Exception.class)
+public ResponseEntity<String> handleError(Exception e) {
+    return ResponseEntity.status(500).body(e.getMessage() + "\n" + Arrays.toString(e.getStackTrace()));
+}
+
+// ❌ NEVER: Disable security for convenience
+http.csrf().disable().authorizeHttpRequests().anyRequest().permitAll();
+
+// ❌ NEVER: Store passwords in plain text
+user.setPassword(request.getPassword());
+
+// ❌ NEVER: Trust user input for file paths
+Path file = Paths.get("/data/" + request.getFilename()); // PATH TRAVERSAL VULNERABILITY
+
+// ❌ NEVER: Use string concatenation in queries
+String query = "SELECT * FROM users WHERE username = '" + username + "'"; // SQL INJECTION
+```
+
+### Code Quality Anti-patterns
+
+```java
+// ❌ NEVER: God classes with too many responsibilities
+@Service
+public class ServerService {
+    // Don't put backup, restore, monitoring, docker, email, scheduling ALL in one class
+}
+
+// ❌ NEVER: Return entity from controller
+@GetMapping("/{id}")
+public Server getServer(@PathVariable UUID id) {
+    return serverRepository.findById(id).orElseThrow();
+}
+
+// ❌ NEVER: Catch and swallow exceptions silently
+try {
+    doSomething();
+} catch (Exception e) {
+    // ignored
+}
+
+// ❌ NEVER: Use field injection
+@Autowired
+private ServerRepository serverRepository; // Use constructor injection instead
+
+// ❌ NEVER: Hardcode configuration
+private static final String DB_PASSWORD = "secret123";
+private static final int PORT = 8080;
+```
+
+### React Anti-patterns
+
+```tsx
+// ❌ NEVER: Fetch in useEffect without cleanup
+useEffect(() => {
+  fetch('/api/servers').then(res => res.json()).then(setServers);
+}, []);
+
+// ❌ NEVER: Mutate state directly
+const handleAdd = () => {
+  servers.push(newServer); // WRONG
+  setServers(servers);
+};
+
+// ❌ NEVER: Store derived state
+const [servers, setServers] = useState([]);
+const [filteredServers, setFilteredServers] = useState([]); // Derive this instead!
+
+// ❌ NEVER: Inline complex logic in JSX
+return (
+  <div>
+    {servers.filter(s => s.status === 'running').map(s => (
+      // Complex nested logic...
+    ))}
+  </div>
+);
+```
+
+---
+
+## 11. Configuration Standards
+
+### Application Properties
+
+```yaml
+# application.yml - NEVER commit secrets!
+spring:
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/mcserverhub}
+    username: ${DATABASE_USERNAME:mcserverhub}
+    password: ${DATABASE_PASSWORD}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+mcserverhub:
+  jwt:
+    secret: ${JWT_SECRET}
+    access-token-expiration: 15m
+    refresh-token-expiration: 7d
+  backup:
+    storage-path: ${BACKUP_STORAGE_PATH:/var/mcserverhub/backups}
+    max-concurrent: 3
+    default-retention-days: 30
+  docker:
+    host: ${DOCKER_HOST:unix:///var/run/docker.sock}
+    network: mcserverhub-network
+```
+
+### Environment Files
+
+```bash
+# .env.example - Template for required environment variables
+# Copy to .env and fill in values (NEVER commit .env!)
+
+DATABASE_URL=jdbc:postgresql://localhost:5432/mcserverhub
+DATABASE_USERNAME=mcserverhub
+DATABASE_PASSWORD=
+
+JWT_SECRET=
+
+DOCKER_HOST=unix:///var/run/docker.sock
+
+# Frontend
+VITE_API_URL=http://localhost:8080
+VITE_WS_URL=ws://localhost:8080
+```
+
+---
+
+## Quick Reference
+
+### Naming Conventions
+
+| Type | Pattern | Example |
+|------|---------|---------|
+| Entity | PascalCase, singular | `Server`, `BackupSchedule` |
+| DTO Request | PascalCase + Request | `CreateServerRequest` |
+| DTO Response | PascalCase + Response | `ServerResponse` |
+| Service | PascalCase + Service | `ServerService` |
+| Repository | PascalCase + Repository | `ServerRepository` |
+| Controller | PascalCase + Controller | `ServerController` |
+| Exception | PascalCase + Exception | `ServerNotFoundException` |
+| React Component | PascalCase | `ServerCard` |
+| React Hook | camelCase, use prefix | `useServer`, `useBackups` |
+| API endpoint | kebab-case, plural | `/api/v1/servers`, `/api/v1/backup-schedules` |
+
+### HTTP Status Codes
+
+| Code | When to Use |
+|------|-------------|
+| 200 | Successful GET, PUT |
+| 201 | Successful POST (resource created) |
+| 204 | Successful DELETE (no content) |
+| 400 | Validation errors, bad request |
+| 401 | Not authenticated |
+| 403 | Authenticated but not authorized |
+| 404 | Resource not found |
+| 409 | Conflict (e.g., backup already in progress) |
+| 500 | Server error (should be rare) |
+
+---
+
+Remember: **Security first, clean code always, test everything.**
